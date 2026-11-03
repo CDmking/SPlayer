@@ -69,7 +69,7 @@
               :id="`lrc-${index}`"
               :class="getLyricLineClass(item, index)"
               :style="getLyricLineStyle(item, index)"
-              @click="jumpSeek(item.data.startTime)"
+              @click="jumpSeek(item, index)"
             >
               <!-- 逐字歌词 -->
               <template v-if="isYrcMode">
@@ -260,6 +260,28 @@ const firstActiveIndex = computed(() => {
   return activeLineIndices.value[0] ?? -1;
 });
 
+/** 滚动动画时长（毫秒） */
+const SCROLL_DURATION = 500;
+/** 滚动提前量（毫秒），略大于动画时长以确保提前到位 */
+const SCROLL_LEAD_MS = SCROLL_DURATION + 100;
+
+/**
+ * 滚动目标行索引
+ * 在下一句开始前就滚动到目标位置，避免高亮先跳、滚动后到
+ */
+const scrollTargetIndex = computed(() => {
+  const list = processedLyrics.value;
+  if (list.length === 0) return -1;
+  const activeIndex = firstActiveIndex.value;
+  // 最多预判一行，避免行距过密时越过目标
+  const nextIndex = activeIndex + 1;
+  const next = list[nextIndex];
+  if (!next) return activeIndex;
+  const nextStart = next.type === "lyric" ? next.data.startTime || 0 : next.startTime;
+  // 已进入提前量范围则提前滚动
+  return props.currentTime + SCROLL_LEAD_MS >= nextStart ? nextIndex : activeIndex;
+});
+
 /** 判断某行是否高亮 */
 const isLineActive = (index: number): boolean => {
   return activeLineIndices.value.includes(index);
@@ -291,6 +313,23 @@ let userScrollTimeoutId: ReturnType<typeof setTimeout> | null = null;
 /** 用户滚动恢复超时时间（毫秒） */
 const USER_SCROLL_TIMEOUT = 3000;
 
+/** 取消滚动动画 */
+const cancelScrollAnimation = () => {
+  if (scrollAnimationId !== null) {
+    cancelAnimationFrame(scrollAnimationId);
+    scrollAnimationId = null;
+  }
+};
+
+/** 重置用户滚动状态 */
+const resetUserScroll = () => {
+  userScrolling.value = false;
+  if (userScrollTimeoutId !== null) {
+    clearTimeout(userScrollTimeoutId);
+    userScrollTimeoutId = null;
+  }
+};
+
 /**
  * 自主滚动
  */
@@ -303,7 +342,7 @@ const handleUserScroll = () => {
   userScrollTimeoutId = setTimeout(() => {
     userScrolling.value = false;
     userScrollTimeoutId = null;
-    lyricsScroll(firstActiveIndex.value);
+    lyricsScroll(scrollTargetIndex.value);
   }, USER_SCROLL_TIMEOUT);
 };
 
@@ -315,10 +354,7 @@ const handleUserScroll = () => {
  */
 const smoothScrollTo = (container: HTMLElement, targetY: number, duration = 300) => {
   // 取消之前的动画
-  if (scrollAnimationId !== null) {
-    cancelAnimationFrame(scrollAnimationId);
-    scrollAnimationId = null;
-  }
+  cancelScrollAnimation();
   // 计算起始位置和目标位置
   const startY = container.scrollTop;
   const diff = targetY - startY;
@@ -350,8 +386,10 @@ const smoothScrollTo = (container: HTMLElement, targetY: number, duration = 300)
 
 /**
  * 歌词滚动
+ * @param index 目标行索引
+ * @param immediate 是否立即定位（跳转、切歌、窗口变化时使用）
  */
-const lyricsScroll = (index: number) => {
+const lyricsScroll = (index: number, immediate = false) => {
   const container = lyricScrollContainer.value;
   if (!container) return;
   // 用户滚动时不自动滚动
@@ -366,20 +404,22 @@ const lyricsScroll = (index: number) => {
   let targetY = elementTop - (containerHeight - elementHeight) * settingStore.lyricsScrollOffset;
   // 确保不超出边界
   targetY = Math.max(0, Math.min(targetY, container.scrollHeight - container.clientHeight));
+  // 立即定位
+  if (immediate) {
+    cancelScrollAnimation();
+    container.scrollTop = targetY;
+    return;
+  }
   // 执行平滑滚动
-  smoothScrollTo(container, targetY, 500);
+  smoothScrollTo(container, targetY, SCROLL_DURATION);
 };
 
 /**
  * 鼠标移出歌词区域恢复自动滚动
  */
 const lrcAllLeave = () => {
-  userScrolling.value = false;
-  if (userScrollTimeoutId !== null) {
-    clearTimeout(userScrollTimeoutId);
-    userScrollTimeoutId = null;
-  }
-  lyricsScroll(firstActiveIndex.value);
+  resetUserScroll();
+  lyricsScroll(scrollTargetIndex.value);
 };
 
 type CssVars = Record<`--${string}`, string>;
@@ -499,49 +539,81 @@ const getLyricLineStyle = (item: ProcessedLyricItem, index: number) => {
 
 /**
  * 进度跳转
+ * @param item 预处理后的歌词项
+ * @param index 在列表中的索引
  */
-const jumpSeek = (time: number) => {
-  if (!time) return;
+const jumpSeek = (item: ProcessedLyricItem, index: number) => {
+  if (item.type !== "lyric" || !item.data.startTime) return;
   // 清除用户滚动状态
-  userScrolling.value = false;
-  if (userScrollTimeoutId !== null) {
-    clearTimeout(userScrollTimeoutId);
-    userScrollTimeoutId = null;
-  }
+  resetUserScroll();
   const offsetMs = statusStore.getSongOffset(musicStore.playSong?.id);
-  player.setSeek(time - offsetMs);
+  player.setSeek(item.data.startTime - offsetMs);
   player.play();
+  // 跳转后立即定位到目标行
+  nextTick(() => lyricsScroll(index, true));
 };
 
-// 监听歌词滚动
+/** 上次进度检查的性能时间戳 */
+let lastSeekCheckAt = performance.now();
+/** 上次进度检查对应的播放进度 */
+let lastSeekCheckSeek = props.currentTime;
+/** 立即定位后忽略提前滚动的截止时间 */
+let ignoreScrollUntil = 0;
+
+// 监听进度跳变，跳转后立即定位
+watch(
+  () => props.currentTime,
+  (time) => {
+    const now = performance.now();
+    const elapsed = now - lastSeekCheckAt;
+    const delta = time - lastSeekCheckSeek;
+    lastSeekCheckAt = now;
+    lastSeekCheckSeek = time;
+    // 进度跳变明显超过真实流逝即视为跳转
+    const isSeek = delta < -500 || delta > elapsed + 2000;
+    if (!isSeek) return;
+    resetUserScroll();
+    // 跳转后不再提前滚动，避免刚定位就被下一句覆盖
+    ignoreScrollUntil = now + 150;
+    lyricsScroll(firstActiveIndex.value, true);
+  },
+);
+
+// 提前滚动：在下一句开始前把目标行移动到锚点位置
+watch(scrollTargetIndex, (index) => {
+  if (performance.now() < ignoreScrollUntil) return;
+  lyricsScroll(index);
+});
+
+// 高亮切换：仅处理逐字歌词淡出
 watch(firstActiveIndex, (val, oldVal) => {
-  lyricsScroll(val);
   if (typeof oldVal === "number" && oldVal >= 0 && oldVal !== val) {
     yrcFadingLineIndex.value = oldVal;
     yrcFadingUntilAt.value = Date.now() + YRC_LINE_FADE_MS;
   }
 });
 
+// 歌词数据变化后重新定位
+watch(processedLyrics, () => {
+  nextTick(() => lyricsScroll(firstActiveIndex.value, true));
+});
+
 onMounted(() => {
   nextTick().then(() => {
-    lyricsScroll(firstActiveIndex.value);
+    lyricsScroll(firstActiveIndex.value, true);
   });
   if (isElectron) {
-    window.electron.ipcRenderer.on("lyricsScroll", () => lyricsScroll(firstActiveIndex.value));
+    window.electron.ipcRenderer.on("lyricsScroll", () =>
+      lyricsScroll(firstActiveIndex.value, true),
+    );
   }
 });
 
 onBeforeUnmount(() => {
   // 清理滚动动画
-  if (scrollAnimationId !== null) {
-    cancelAnimationFrame(scrollAnimationId);
-    scrollAnimationId = null;
-  }
+  cancelScrollAnimation();
   // 清理用户滚动超时
-  if (userScrollTimeoutId !== null) {
-    clearTimeout(userScrollTimeoutId);
-    userScrollTimeoutId = null;
-  }
+  resetUserScroll();
   if (isElectron) {
     window.electron.ipcRenderer.removeAllListeners("lyricsScroll");
   }
