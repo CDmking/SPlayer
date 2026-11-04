@@ -13,6 +13,8 @@
       ),
       '--lrc-bold': settingStore.lyricFontWeight,
       '--lrc-left-padding': `${settingStore.lyricHorizontalOffset}px`,
+      '--lrc-transition-duration': `${LYRIC_TRANSITION_MS}ms`,
+      '--lrc-transition-ease': LYRIC_EASING,
       'font-family': settingStore.LyricFont !== 'follow' ? settingStore.LyricFont : '',
       cursor: statusStore.playerMetaShow ? 'auto' : 'none',
       ...lyricLangFontStyle(settingStore),
@@ -69,7 +71,7 @@
               :id="`lrc-${index}`"
               :class="getLyricLineClass(item, index)"
               :style="getLyricLineStyle(item, index)"
-              @click="jumpSeek(item.data.startTime)"
+              @click="jumpSeek(item, index)"
             >
               <!-- 逐字歌词 -->
               <template v-if="isYrcMode">
@@ -139,6 +141,12 @@ import { usePlayerController } from "@/core/player/PlayerController";
 import { getLyricLanguage } from "@/utils/format";
 import { isElectron } from "@/utils/env";
 import { lyricLangFontStyle } from "@/utils/lyric/lyricFontConfig";
+import {
+  LYRIC_EASING,
+  LYRIC_LEAD_MS,
+  LYRIC_TRANSITION_MS,
+  lyricEasing,
+} from "@/utils/lyric/timing";
 import { getFontSize } from "@/utils/style";
 
 const props = defineProps({
@@ -162,6 +170,9 @@ const isYrcMode = computed(() => settingStore.showWordLyrics && musicStore.isHas
 const currentLyricData = computed(() => {
   return isYrcMode.value ? musicStore.songLyric.yrcData : musicStore.songLyric.lrcData;
 });
+
+/** 视觉进度，含提前量，与桌面歌词保持一致 */
+const visualTime = computed(() => props.currentTime + LYRIC_LEAD_MS);
 
 /** 处理后的歌词项类型 */
 type ProcessedLyricItem =
@@ -216,14 +227,14 @@ const processedLyrics = computed<ProcessedLyricItem[]>(() => {
 const isCountdownVisible = (item: ProcessedLyricItem): boolean => {
   if (item.type !== "countdown") return false;
   // 计算实时时间 - 0.5s 是否小于开始 + 持续时间
-  return props.currentTime + 500 < item.startTime + item.duration;
+  return visualTime.value + 500 < item.startTime + item.duration;
 };
 
 /** 计算当前活跃的歌词行索引列表 */
 const activeLineIndices = computed<number[]>(() => {
   const lyrics = processedLyrics.value;
   if (!lyrics || lyrics.length === 0) return [];
-  const currentSeek = props.currentTime;
+  const currentSeek = visualTime.value;
   const activeCandidates: number[] = [];
 
   for (let i = 0; i < lyrics.length; i++) {
@@ -273,7 +284,7 @@ const isLineActive = (index: number): boolean => {
 const getPointOpacity = (item: ProcessedLyricItem, index: number): number => {
   if (item.type !== "countdown") return 0;
   const perPointTime = item.duration / 3;
-  const currentTime = props.currentTime - item.startTime;
+  const currentTime = visualTime.value - item.startTime;
   if (currentTime <= 0) return 0;
   if (currentTime < perPointTime * (index + 1)) {
     const percentage = (currentTime - perPointTime * index) / perPointTime;
@@ -290,6 +301,23 @@ const userScrolling = ref(false);
 let userScrollTimeoutId: ReturnType<typeof setTimeout> | null = null;
 /** 用户滚动恢复超时时间（毫秒） */
 const USER_SCROLL_TIMEOUT = 3000;
+
+/** 取消滚动动画 */
+const cancelScrollAnimation = () => {
+  if (scrollAnimationId !== null) {
+    cancelAnimationFrame(scrollAnimationId);
+    scrollAnimationId = null;
+  }
+};
+
+/** 重置用户滚动状态 */
+const resetUserScroll = () => {
+  userScrolling.value = false;
+  if (userScrollTimeoutId !== null) {
+    clearTimeout(userScrollTimeoutId);
+    userScrollTimeoutId = null;
+  }
+};
 
 /**
  * 自主滚动
@@ -309,16 +337,13 @@ const handleUserScroll = () => {
 
 /**
  * 平滑滚动
+ * 时长与缓动与桌面歌词保持一致
  * @param container 滚动容器
  * @param targetY 目标位置
- * @param duration 滚动时间
  */
-const smoothScrollTo = (container: HTMLElement, targetY: number, duration = 300) => {
+const smoothScrollTo = (container: HTMLElement, targetY: number) => {
   // 取消之前的动画
-  if (scrollAnimationId !== null) {
-    cancelAnimationFrame(scrollAnimationId);
-    scrollAnimationId = null;
-  }
+  cancelScrollAnimation();
   // 计算起始位置和目标位置
   const startY = container.scrollTop;
   const diff = targetY - startY;
@@ -334,11 +359,8 @@ const smoothScrollTo = (container: HTMLElement, targetY: number, duration = 300)
    */
   const step = (currentTime: number) => {
     const elapsed = currentTime - startTime;
-    const progress = Math.min(elapsed / duration, 1);
-    // easeInOutQuad 缓动
-    const easedProgress =
-      progress < 0.5 ? 2 * progress * progress : 1 - Math.pow(-2 * progress + 2, 2) / 2;
-    container.scrollTop = startY + diff * easedProgress;
+    const progress = Math.min(elapsed / LYRIC_TRANSITION_MS, 1);
+    container.scrollTop = startY + diff * lyricEasing(progress);
     if (progress < 1) {
       scrollAnimationId = requestAnimationFrame(step);
     } else {
@@ -350,8 +372,10 @@ const smoothScrollTo = (container: HTMLElement, targetY: number, duration = 300)
 
 /**
  * 歌词滚动
+ * @param index 目标行索引
+ * @param immediate 是否立即定位（跳转、切歌、窗口变化时使用）
  */
-const lyricsScroll = (index: number) => {
+const lyricsScroll = (index: number, immediate = false) => {
   const container = lyricScrollContainer.value;
   if (!container) return;
   // 用户滚动时不自动滚动
@@ -366,19 +390,21 @@ const lyricsScroll = (index: number) => {
   let targetY = elementTop - (containerHeight - elementHeight) * settingStore.lyricsScrollOffset;
   // 确保不超出边界
   targetY = Math.max(0, Math.min(targetY, container.scrollHeight - container.clientHeight));
+  // 立即定位
+  if (immediate) {
+    cancelScrollAnimation();
+    container.scrollTop = targetY;
+    return;
+  }
   // 执行平滑滚动
-  smoothScrollTo(container, targetY, 500);
+  smoothScrollTo(container, targetY);
 };
 
 /**
  * 鼠标移出歌词区域恢复自动滚动
  */
 const lrcAllLeave = () => {
-  userScrolling.value = false;
-  if (userScrollTimeoutId !== null) {
-    clearTimeout(userScrollTimeoutId);
-    userScrollTimeoutId = null;
-  }
+  resetUserScroll();
   lyricsScroll(firstActiveIndex.value);
 };
 
@@ -411,7 +437,7 @@ const getYrcFadeFactor = (index: number): number => {
  * @param lyricIndex 歌词行索引
  */
 const getYrcVars = (wordData: LyricWord, lyricIndex: number): CssVars => {
-  const currentSeek = props.currentTime;
+  const currentSeek = visualTime.value;
   const fadeFactor = getYrcFadeFactor(lyricIndex);
   // 判断是否显示
   const currentLineItem = processedLyrics.value[lyricIndex];
@@ -499,21 +525,45 @@ const getLyricLineStyle = (item: ProcessedLyricItem, index: number) => {
 
 /**
  * 进度跳转
+ * @param item 预处理后的歌词项
+ * @param index 在列表中的索引
  */
-const jumpSeek = (time: number) => {
-  if (!time) return;
+const jumpSeek = (item: ProcessedLyricItem, index: number) => {
+  if (item.type !== "lyric" || !item.data.startTime) return;
   // 清除用户滚动状态
-  userScrolling.value = false;
-  if (userScrollTimeoutId !== null) {
-    clearTimeout(userScrollTimeoutId);
-    userScrollTimeoutId = null;
-  }
+  resetUserScroll();
   const offsetMs = statusStore.getSongOffset(musicStore.playSong?.id);
-  player.setSeek(time - offsetMs);
+  player.setSeek(item.data.startTime - offsetMs);
   player.play();
+  // 跳转后立即定位到目标行
+  nextTick(() => lyricsScroll(index, true));
 };
 
-// 监听歌词滚动
+/** 上次进度检查的性能时间戳 */
+let lastSeekCheckAt = performance.now();
+/** 上次进度检查对应的播放进度 */
+let lastSeekCheckSeek = props.currentTime;
+
+// 监听进度跳变，跳转后立即定位
+watch(
+  () => props.currentTime,
+  (time) => {
+    const now = performance.now();
+    const elapsed = now - lastSeekCheckAt;
+    const delta = time - lastSeekCheckSeek;
+    lastSeekCheckAt = now;
+    lastSeekCheckSeek = time;
+    // 播放中进度跳变明显超过真实流逝即视为跳转；暂停时进度只会因跳转变化
+    const isSeek = statusStore.playStatus
+      ? delta < -500 || delta > elapsed + 2000
+      : Math.abs(delta) > 100;
+    if (!isSeek) return;
+    resetUserScroll();
+    lyricsScroll(firstActiveIndex.value, true);
+  },
+);
+
+// 换句：滚动与高亮同时开始，共用同一条过渡曲线
 watch(firstActiveIndex, (val, oldVal) => {
   lyricsScroll(val);
   if (typeof oldVal === "number" && oldVal >= 0 && oldVal !== val) {
@@ -522,26 +572,27 @@ watch(firstActiveIndex, (val, oldVal) => {
   }
 });
 
+// 歌词数据变化后重新定位
+watch(processedLyrics, () => {
+  nextTick(() => lyricsScroll(firstActiveIndex.value, true));
+});
+
 onMounted(() => {
   nextTick().then(() => {
-    lyricsScroll(firstActiveIndex.value);
+    lyricsScroll(firstActiveIndex.value, true);
   });
   if (isElectron) {
-    window.electron.ipcRenderer.on("lyricsScroll", () => lyricsScroll(firstActiveIndex.value));
+    window.electron.ipcRenderer.on("lyricsScroll", () =>
+      lyricsScroll(firstActiveIndex.value, true),
+    );
   }
 });
 
 onBeforeUnmount(() => {
   // 清理滚动动画
-  if (scrollAnimationId !== null) {
-    cancelAnimationFrame(scrollAnimationId);
-    scrollAnimationId = null;
-  }
+  cancelScrollAnimation();
   // 清理用户滚动超时
-  if (userScrollTimeoutId !== null) {
-    clearTimeout(userScrollTimeoutId);
-    userScrollTimeoutId = null;
-  }
+  resetUserScroll();
   if (isElectron) {
     window.electron.ipcRenderer.removeAllListeners("lyricsScroll");
   }
@@ -634,9 +685,9 @@ onBeforeUnmount(() => {
     transform-origin: left center;
     will-change: filter, opacity, transform;
     transition:
-      filter 0.35s,
-      opacity 0.35s,
-      transform 0.5s cubic-bezier(0.25, 0.1, 0.25, 1);
+      filter var(--lrc-transition-duration, 600ms) var(--lrc-transition-ease, ease),
+      opacity var(--lrc-transition-duration, 600ms) var(--lrc-transition-ease, ease),
+      transform var(--lrc-transition-duration, 600ms) var(--lrc-transition-ease, ease);
     cursor: pointer;
     width: 100%;
     .content {
@@ -692,7 +743,7 @@ onBeforeUnmount(() => {
       margin-top: 8px;
       opacity: 0.6;
       font-size: var(--lrc-tran-size);
-      transition: opacity 0.35s;
+      transition: opacity var(--lrc-transition-duration, 600ms) var(--lrc-transition-ease, ease);
       width: 100%;
       overflow-wrap: anywhere;
       word-break: break-word;
@@ -703,7 +754,7 @@ onBeforeUnmount(() => {
       margin-top: 4px;
       opacity: 0.5;
       font-size: var(--lrc-roma-size);
-      transition: opacity 0.35s;
+      transition: opacity var(--lrc-transition-duration, 600ms) var(--lrc-transition-ease, ease);
       width: 100%;
       overflow-wrap: anywhere;
       word-break: break-word;

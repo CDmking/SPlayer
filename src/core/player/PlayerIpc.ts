@@ -81,7 +81,7 @@ export const sendLyric: (data: unknown) => void = throttle((data: unknown) => {
       ? { ...data, sendTimestamp: performance.now() }
       : data;
   sendIpc("play-lyric-change", payload);
-}, 500);
+}, 200);
 
 /**
  * 发送喜欢状态
