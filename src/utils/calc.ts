@@ -1,4 +1,5 @@
 import { LyricLine } from "@applemusic-like-lyrics/lyric";
+import { LYRIC_LEAD_MS } from "@/utils/lyric/timing";
 
 /**
  * 计算歌词索引
@@ -16,8 +17,8 @@ export const calculateLyricIndex = (
 ): number => {
   // 边界检查
   if (!lyrics || !lyrics.length) return -1;
-  // 预处理时间
-  const playSeek = currentTime + offset + 300;
+  // 预处理时间（含视觉提前量）
+  const playSeek = currentTime + offset + LYRIC_LEAD_MS;
   const getStart = (v: LyricLine) => v.startTime || 0;
   // 直接返回最后一句
   const lastLine = lyrics[lyrics.length - 1];

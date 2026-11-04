@@ -9,7 +9,11 @@
           'no-animation': !lyricConfig.animation,
         },
       ]"
-      :style="{ '--mask-bg-color': lyricConfig.backgroundMaskColor }"
+      :style="{
+        '--mask-bg-color': lyricConfig.backgroundMaskColor,
+        '--lyric-transition-duration': `${LYRIC_TRANSITION_MS}ms`,
+        '--lyric-transition-ease': LYRIC_EASING,
+      }"
     >
       <div class="header" align="center" justify="space-between">
         <n-flex :wrap="false" align="center" justify="flex-start" size="small" @pointerdown.stop>
@@ -165,6 +169,7 @@ import { LyricWord } from "@applemusic-like-lyrics/lyric";
 import { calculateLyricIndex, getSafeEndTime } from "@/utils/calc";
 import { LyricConfig, LyricData, RenderLine } from "@/types/desktop-lyric";
 import defaultDesktopLyricConfig from "@/assets/data/lyricConfig";
+import { LYRIC_EASING, LYRIC_LEAD_MS, LYRIC_TRANSITION_MS } from "@/utils/lyric/timing";
 
 const FALLBACK_INITIALIZATION_TIMEOUT = 2000; // 歌词窗口初始化后备超时时间，用于防止无数据时无限期空白
 
@@ -207,8 +212,8 @@ const { pause: pauseSeek, resume: resumeSeek } = useRafFn(() => {
   }
 });
 
-// 300ms 提前量，用于补偿动画和感知延迟
-const LYRIC_LOOKAHEAD = 300;
+// 视觉提前量，与主播放页共用
+const LYRIC_LOOKAHEAD = LYRIC_LEAD_MS;
 
 // 实时歌词索引
 const currentLyricIndex = computed(() => {
@@ -742,7 +747,7 @@ onMounted(() => {
         }
         // 阈值检测：只有当新时间与当前插值时间差距超过阈值时才重置锚点
         // 这样可以避免在正常播放时频繁重置导致的微小抖动
-        const SYNC_THRESHOLD = 300; // 300ms 阈值
+        const SYNC_THRESHOLD = 150; // 150ms 阈值，保证与主播放页的时间轴同步
         const drift = Math.abs(newBaseMs - playSeekMs.value);
         if (drift > SYNC_THRESHOLD) {
           baseMs = newBaseMs;
@@ -952,11 +957,11 @@ onBeforeUnmount(() => {
       text-overflow: ellipsis;
       white-space: nowrap;
       transition:
-        top 0.6s cubic-bezier(0.55, 0, 0.1, 1),
-        font-size 0.6s cubic-bezier(0.55, 0, 0.1, 1),
-        color 0.6s cubic-bezier(0.55, 0, 0.1, 1),
-        opacity 0.6s cubic-bezier(0.55, 0, 0.1, 1),
-        transform 0.6s cubic-bezier(0.55, 0, 0.1, 1);
+        top var(--lyric-transition-duration, 600ms) var(--lyric-transition-ease, ease),
+        font-size var(--lyric-transition-duration, 600ms) var(--lyric-transition-ease, ease),
+        color var(--lyric-transition-duration, 600ms) var(--lyric-transition-ease, ease),
+        opacity var(--lyric-transition-duration, 600ms) var(--lyric-transition-ease, ease),
+        transform var(--lyric-transition-duration, 600ms) var(--lyric-transition-ease, ease);
       will-change: top, font-size, transform;
       transform-origin: left center;
 
@@ -1055,8 +1060,8 @@ onBeforeUnmount(() => {
   .lyric-slide-enter-active,
   .lyric-slide-leave-active {
     transition:
-      transform 0.6s cubic-bezier(0.55, 0, 0.1, 1),
-      opacity 0.6s cubic-bezier(0.55, 0, 0.1, 1);
+      transform var(--lyric-transition-duration, 600ms) var(--lyric-transition-ease, ease),
+      opacity var(--lyric-transition-duration, 600ms) var(--lyric-transition-ease, ease);
     will-change: transform, opacity;
   }
   .lyric-slide-enter-from {
